@@ -1121,13 +1121,19 @@ faulthandler_stack_overflow(PyObject *self, PyObject *Py_UNUSED(ignored))
 {
     size_t depth, size;
     uintptr_t sp = (uintptr_t)&depth;
-    uintptr_t stop;
+    uintptr_t stop, lower_limit, upper_limit;
 
     faulthandler_suppress_crash_report();
     depth = 0;
-    stop = stack_overflow(sp - STACK_OVERFLOW_MAX_SIZE,
-                          sp + STACK_OVERFLOW_MAX_SIZE,
-                          &depth);
+
+    lower_limit = sp - STACK_OVERFLOW_MAX_SIZE;
+    if (lower_limit > sp)
+        lower_limit = 0;
+    upper_limit = sp + STACK_OVERFLOW_MAX_SIZE;
+    if (upper_limit < sp)
+        upper_limit = UINTPTR_MAX;
+
+    stop = stack_overflow(lower_limit, upper_limit, &depth);
     if (sp < stop)
         size = stop - sp;
     else

@@ -344,11 +344,6 @@ typedef struct {
     enum py_ssl_server_or_client socket_type;
     PyObject *owner; /* weakref to Python level "owner" passed to servername callback */
     PyObject *server_hostname;
-    /* Some SSL callbacks don't have error reporting. Callback wrappers
-     * store exception information on the socket. The handshake, read, write,
-     * and shutdown methods check for chained exceptions.
-     */
-    PyObject *exc;
 } PySSLSocket;
 
 #define PySSLSocket_CAST(op)    ((PySSLSocket *)(op))
@@ -641,18 +636,12 @@ fail:
     PyUnicodeWriter_Discard(writer);
 }
 
-static int
-PySSL_ChainExceptions(PySSLSocket *sslsock) {
-    if (sslsock->exc == NULL)
-        return 0;
-
-    _PyErr_ChainExceptions1(sslsock->exc);
-    sslsock->exc = NULL;
-    return -1;
-}
-
+// Set the appropriate SSL error exception.
+// err - error information from SSL and libc
+// exc - if not NULL, an exception from _debughelpers.c callback to be chained
 static PyObject *
-PySSL_SetError(PySSLSocket *sslsock, _PySSLError err, const char *filename, int lineno)
+PySSL_SetError(PySSLSocket *sslsock, _PySSLError err, PyObject *exc,
+               const char *filename, int lineno)
 {
     PyObject *type;
     char *errstr = NULL;
@@ -760,7 +749,7 @@ PySSL_SetError(PySSLSocket *sslsock, _PySSLError err, const char *filename, int 
     }
     fill_and_set_sslerror(state, sslsock, type, p, errstr, lineno, e);
     ERR_clear_error();
-    PySSL_ChainExceptions(sslsock);
+    _PyErr_ChainExceptions1(exc);  // chain any exceptions from callbacks
     return NULL;
 }
 
@@ -892,7 +881,6 @@ newPySSLSocket(PySSLContext *sslctx, PySocketSockObject *sock,
     self->shutdown_seen_zero = 0;
     self->owner = NULL;
     self->server_hostname = NULL;
-    self->exc = NULL;
 
     /* Make sure the SSL error state is initialized */
     ERR_clear_error();
@@ -1013,6 +1001,7 @@ _ssl__SSLSocket_do_handshake_impl(PySSLSocket *self)
 {
     int ret;
     _PySSLError err;
+    PyObject *exc = NULL;
     int sockstate, nonblocking;
     PySocketSockObject *sock = GET_SOCKET(self);
     PyTime_t timeout, deadline = 0;
@@ -1048,6 +1037,12 @@ _ssl__SSLSocket_do_handshake_impl(PySSLSocket *self)
         Py_END_ALLOW_THREADS;
         _PySSL_FIX_ERRNO;
 
+        // Get any exception that occurred in a debughelpers.c callback
+        exc = PyErr_GetRaisedException();
+        if (exc != NULL) {
+            break;
+        }
+
         if (PyErr_CheckSignals())
             goto error;
 
@@ -1082,13 +1077,15 @@ _ssl__SSLSocket_do_handshake_impl(PySSLSocket *self)
     Py_XDECREF(sock);
 
     if (ret < 1)
-        return PySSL_SetError(self, err, __FILE__, __LINE__);
-    if (PySSL_ChainExceptions(self) < 0)
+        return PySSL_SetError(self, err, exc, __FILE__, __LINE__);
+    if (exc != NULL) {
+        PyErr_SetRaisedException(exc);
         return NULL;
+    }
     Py_RETURN_NONE;
 error:
+    assert(exc == NULL);
     Py_XDECREF(sock);
-    PySSL_ChainExceptions(self);
     return NULL;
 }
 
@@ -2339,9 +2336,7 @@ _ssl__SSLSocket_owner_set_impl(PySSLSocket *self, PyObject *value)
 static int
 PySSL_traverse(PyObject *op, visitproc visit, void *arg)
 {
-    PySSLSocket *self = PySSLSocket_CAST(op);
-    Py_VISIT(self->exc);
-    Py_VISIT(Py_TYPE(self));
+    Py_VISIT(Py_TYPE(op));
     return 0;
 }
 
@@ -2353,7 +2348,6 @@ PySSL_clear(PyObject *op)
     Py_CLEAR(self->ctx);
     Py_CLEAR(self->owner);
     Py_CLEAR(self->server_hostname);
-    Py_CLEAR(self->exc);
     return 0;
 }
 
@@ -2473,6 +2467,7 @@ _ssl__SSLSocket_write_impl(PySSLSocket *self, Py_buffer *b)
     int retval;
     int sockstate;
     _PySSLError err;
+    PyObject *exc = NULL;
     int nonblocking;
     PySocketSockObject *sock = GET_SOCKET(self);
     PyTime_t timeout, deadline = 0;
@@ -2523,6 +2518,11 @@ _ssl__SSLSocket_write_impl(PySSLSocket *self, Py_buffer *b)
         Py_END_ALLOW_THREADS;
         _PySSL_FIX_ERRNO;
 
+        exc = PyErr_GetRaisedException();
+        if (exc != NULL) {
+            break;
+        }
+
         if (PyErr_CheckSignals())
             goto error;
 
@@ -2554,13 +2554,15 @@ _ssl__SSLSocket_write_impl(PySSLSocket *self, Py_buffer *b)
 
     Py_XDECREF(sock);
     if (retval == 0)
-        return PySSL_SetError(self, err, __FILE__, __LINE__);
-    if (PySSL_ChainExceptions(self) < 0)
+        return PySSL_SetError(self, err, exc, __FILE__, __LINE__);
+    if (exc != NULL) {
+        PyErr_SetRaisedException(exc);
         return NULL;
+    }
     return PyLong_FromSize_t(count);
 error:
+    assert(exc == NULL);
     Py_XDECREF(sock);
-    PySSL_ChainExceptions(self);
     return NULL;
 }
 
@@ -2585,7 +2587,7 @@ _ssl__SSLSocket_pending_impl(PySSLSocket *self)
     _PySSL_FIX_ERRNO;
 
     if (count < 0)
-        return PySSL_SetError(self, err, __FILE__, __LINE__);
+        return PySSL_SetError(self, err, NULL, __FILE__, __LINE__);
     else
         return PyLong_FromLong(count);
 }
@@ -2613,6 +2615,7 @@ _ssl__SSLSocket_read_impl(PySSLSocket *self, Py_ssize_t len,
     int retval;
     int sockstate;
     _PySSLError err;
+    PyObject *exc = NULL;
     int nonblocking;
     PySocketSockObject *sock = GET_SOCKET(self);
     PyTime_t timeout, deadline = 0;
@@ -2678,6 +2681,11 @@ _ssl__SSLSocket_read_impl(PySSLSocket *self, Py_ssize_t len,
         Py_END_ALLOW_THREADS;
         _PySSL_FIX_ERRNO;
 
+        exc = PyErr_GetRaisedException();
+        if (exc != NULL) {
+            break;
+        }
+
         if (PyErr_CheckSignals())
             goto error;
 
@@ -2709,13 +2717,18 @@ _ssl__SSLSocket_read_impl(PySSLSocket *self, Py_ssize_t len,
              err.ssl == SSL_ERROR_WANT_WRITE);
 
     if (retval == 0) {
-        PySSL_SetError(self, err, __FILE__, __LINE__);
+        PySSL_SetError(self, err, exc, __FILE__, __LINE__);
+        exc = NULL;
         goto error;
     }
-    if (self->exc != NULL)
+    else if (exc != NULL) {
+        PyErr_SetRaisedException(exc);
+        exc = NULL;
         goto error;
+    }
 
 done:
+    assert(exc == NULL);
     Py_XDECREF(sock);
     if (!group_right_1) {
         _PyBytes_Resize(&dest, count);
@@ -2726,7 +2739,7 @@ done:
     }
 
 error:
-    PySSL_ChainExceptions(self);
+    assert(exc == NULL);
     Py_XDECREF(sock);
     if (!group_right_1)
         Py_XDECREF(dest);
@@ -2745,6 +2758,7 @@ _ssl__SSLSocket_shutdown_impl(PySSLSocket *self)
 /*[clinic end generated code: output=ca1aa7ed9d25ca42 input=98d9635cd4e16514]*/
 {
     _PySSLError err;
+    PyObject *exc = NULL;
     int sockstate, nonblocking, ret;
     int zeros = 0;
     PySocketSockObject *sock = GET_SOCKET(self);
@@ -2789,6 +2803,11 @@ _ssl__SSLSocket_shutdown_impl(PySSLSocket *self)
         err = _PySSL_errno(ret < 0, self->ssl, ret);
         Py_END_ALLOW_THREADS;
         _PySSL_FIX_ERRNO;
+
+        exc = PyErr_GetRaisedException();
+        if (exc != NULL) {
+            break;
+        }
 
         /* If err == 1, a secure shutdown with SSL_shutdown() is complete */
         if (ret > 0)
@@ -2836,11 +2855,14 @@ _ssl__SSLSocket_shutdown_impl(PySSLSocket *self)
     }
     if (ret < 0) {
         Py_XDECREF(sock);
-        PySSL_SetError(self, err, __FILE__, __LINE__);
+        PySSL_SetError(self, err, exc, __FILE__, __LINE__);
         return NULL;
     }
-    if (self->exc != NULL)
-        goto error;
+    else if (exc != NULL) {
+        Py_XDECREF(sock);
+        PyErr_SetRaisedException(exc);
+        return NULL;
+    }
     if (sock)
         /* It's already INCREF'ed */
         return (PyObject *) sock;
@@ -2848,8 +2870,8 @@ _ssl__SSLSocket_shutdown_impl(PySSLSocket *self)
         Py_RETURN_NONE;
 
 error:
+    assert(exc == NULL);
     Py_XDECREF(sock);
-    PySSL_ChainExceptions(self);
     return NULL;
 }
 
@@ -3051,7 +3073,6 @@ static PyType_Slot PySSLSocket_slots[] = {
     {Py_tp_getset, ssl_getsetlist},
     {Py_tp_dealloc, PySSL_dealloc},
     {Py_tp_traverse, PySSL_traverse},
-    {Py_tp_clear, PySSL_clear},
     {0, 0},
 };
 

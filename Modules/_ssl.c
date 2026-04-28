@@ -1047,6 +1047,11 @@ _ssl__SSLSocket_do_handshake_impl(PySSLSocket *self)
         BIO_set_nbio(SSL_get_wbio(self->ssl), nonblocking);
     }
 
+    if (self->got_eof_error) {
+        set_eof_error(self);
+        goto error;
+    }
+
     timeout = GET_SOCKET_TIMEOUT(sock);
     has_timeout = (timeout > 0);
     if (has_timeout) {
@@ -2515,15 +2520,15 @@ _ssl__SSLSocket_write_impl(PySSLSocket *self, Py_buffer *b)
         BIO_set_nbio(SSL_get_wbio(self->ssl), nonblocking);
     }
 
+    if (self->got_eof_error) {
+        set_eof_error(self);
+        goto error;
+    }
+
     timeout = GET_SOCKET_TIMEOUT(sock);
     has_timeout = (timeout > 0);
     if (has_timeout) {
         deadline = _PyDeadline_Init(timeout);
-    }
-
-    if (self->got_eof_error) {
-        set_eof_error(self);
-        goto error;
     }
 
     sockstate = PySSL_select(sock, 1, timeout);

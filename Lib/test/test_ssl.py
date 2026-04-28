@@ -4798,8 +4798,8 @@ class ThreadedTests(unittest.TestCase):
             with self.assertRaises(ssl.SSLEOFError):
                 sslobj.read(1024)
 
-            # Following read(), sendfile() and write() calls must raise
-            # SSLEOFError
+            # Following read(), sendfile(), write() and do_handshake() calls
+            # must raise SSLEOFError
             with self.assertRaises(ssl.SSLEOFError):
                 # The _SSLSocket remembers the previous EOF error
                 # and raises again SSLEOFError
